@@ -1,0 +1,480 @@
+-- Tabela de produtos
+CREATE TABLE produto (
+    id_produto SERIAL PRIMARY KEY,
+    nome VARCHAR(300) NOT NULL,
+    descricao TEXT,
+    unidade_medida VARCHAR(20) NOT NULL
+);
+
+-- Tabela de lotes
+CREATE TABLE lote (
+    id_lote SERIAL PRIMARY KEY,
+    id_produto INTEGER NOT NULL REFERENCES produto(id_produto),
+    quantidade DECIMAL(10, 3) NOT NULL,
+    valor_unitario DECIMAL(10, 2) NOT NULL,
+    data_entrada TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fornecedor VARCHAR(100) NOT NULL,
+    numero_nota VARCHAR(50),
+    CONSTRAINT fk_produto FOREIGN KEY (id_produto) REFERENCES produto(id_produto)
+);
+
+-- Tabela de movimentações
+CREATE TABLE movimentacao (
+    id_movimentacao SERIAL PRIMARY KEY,
+    id_lote INTEGER NOT NULL REFERENCES lote(id_lote),
+    tipo VARCHAR(7) NOT NULL CHECK (tipo IN ('ENTRADA', 'SAIDA')),
+    quantidade DECIMAL(10, 3) NOT NULL,
+    data_movimentacao TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    responsavel VARCHAR(100) NOT NULL,
+    os VARCHAR(50) NOT NULL,
+    metodo VARCHAR(6) NOT NULL CHECK (metodo IN ('PEPS', 'MANUAL')),
+    CONSTRAINT fk_lote FOREIGN KEY (id_lote) REFERENCES lote(id_lote)
+);
+
+-- Índices
+CREATE INDEX idx_produto_nome ON produto(nome);
+CREATE INDEX idx_lote_produto ON lote(id_produto);
+CREATE INDEX idx_movimentacao_lote ON movimentacao(id_lote);
+CREATE INDEX idx_movimentacao_os ON movimentacao(os);
+
+CREATE OR REPLACE FUNCTION entrada_lote(
+    p_id_produto INTEGER,
+    p_quantidade DECIMAL,
+    p_valor_unitario DECIMAL,
+    p_fornecedor VARCHAR,
+    p_numero_nota VARCHAR
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_id_lote INTEGER;
+BEGIN
+    INSERT INTO lote (
+        id_produto, quantidade, valor_unitario, 
+        fornecedor, numero_nota
+    ) VALUES (
+        p_id_produto, p_quantidade, p_valor_unitario,
+        p_fornecedor, NULLIF(p_numero_nota, '')
+    ) RETURNING id_lote INTO v_id_lote;
+    
+    INSERT INTO movimentacao (
+        id_lote, tipo, quantidade, responsavel, os, metodo
+    ) VALUES (
+        v_id_lote, 'ENTRADA', p_quantidade, p_fornecedor, 'ENTRADA', 'MANUAL'
+    );
+    
+    RETURN 'Lote ' || v_id_lote || ' cadastrado com sucesso';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Função para retirada PEPS
+CREATE OR REPLACE FUNCTION retirada_peps(
+    p_id_produto INTEGER,
+    p_quantidade DECIMAL,
+    p_responsavel VARCHAR,
+    p_os VARCHAR
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_restante DECIMAL := p_quantidade;
+    v_id_lote INTEGER;
+    v_disponivel DECIMAL;
+    v_unidade_medida VARCHAR;
+    v_retirado DECIMAL := 0;
+BEGIN
+    -- Obtém a unidade de medida do produto
+    SELECT unidade_medida INTO v_unidade_medida FROM produto WHERE id_produto = p_id_produto;
+    
+    -- Loop pelos lotes disponíveis ordenados pela data de entrada (PEPS)
+    FOR v_id_lote, v_disponivel IN
+        SELECT l.id_lote, 
+               (l.quantidade - COALESCE((
+                   SELECT SUM(m.quantidade)
+                   FROM movimentacao m
+                   WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+               ), 0)) as saldo
+        FROM lote l
+        WHERE l.id_produto = p_id_produto
+          AND (l.quantidade - COALESCE((
+                   SELECT SUM(m.quantidade)
+                   FROM movimentacao m
+                   WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+               ), 0)) > 0
+        ORDER BY l.data_entrada
+    LOOP
+        IF v_disponivel >= v_restante THEN
+            -- Se tem quantidade suficiente neste lote
+            INSERT INTO movimentacao (
+                id_lote, tipo, quantidade, data_movimentacao, 
+                responsavel, os, metodo
+            ) VALUES (
+                v_id_lote, 'SAIDA', v_restante, CURRENT_TIMESTAMP, 
+                p_responsavel, p_os, 'PEPS'
+            );
+            v_retirado := v_retirado + v_restante;
+            v_restante := 0;
+        ELSE
+            -- Se não tem suficiente, usa todo o disponível e passa para o próximo lote
+            INSERT INTO movimentacao (
+                id_lote, tipo, quantidade, data_movimentacao, 
+                responsavel, os, metodo
+            ) VALUES (
+                v_id_lote, 'SAIDA', v_disponivel, CURRENT_TIMESTAMP, 
+                p_responsavel, p_os, 'PEPS'
+            );
+            v_retirado := v_retirado + v_disponivel;
+            v_restante := v_restante - v_disponivel;
+        END IF;
+        
+        EXIT WHEN v_restante <= 0;
+    END LOOP;
+    
+    -- Retorna mensagem apropriada
+    IF v_restante > 0 THEN
+        RETURN 'Retirada parcial: ' || v_retirado || ' ' || v_unidade_medida || 
+               ' retirados (PEPS). Faltam: ' || v_restante || ' ' || v_unidade_medida;
+    ELSE
+        RETURN 'Retirada completa: ' || p_quantidade || ' ' || v_unidade_medida || ' retirados (PEPS)';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Função para retirada manual
+CREATE OR REPLACE FUNCTION retirada_manual(
+    p_id_lote INTEGER,
+    p_quantidade DECIMAL,
+    p_responsavel VARCHAR,
+    p_os VARCHAR
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_disponivel DECIMAL;
+    v_unidade_medida VARCHAR;
+BEGIN
+    SELECT 
+        l.quantidade - COALESCE((
+            SELECT SUM(m.quantidade)
+            FROM movimentacao m
+            WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+        ), 0),
+        p.unidade_medida
+    INTO 
+        v_disponivel, v_unidade_medida
+    FROM 
+        lote l
+    JOIN 
+        produto p ON l.id_produto = p.id_produto
+    WHERE 
+        l.id_lote = p_id_lote;
+    
+    IF v_disponivel < p_quantidade THEN
+        RAISE EXCEPTION 'Saldo insuficiente no lote. Disponível: % %', 
+                      v_disponivel, v_unidade_medida;
+    END IF;
+    
+    INSERT INTO movimentacao VALUES (
+        DEFAULT, p_id_lote, 'SAIDA', p_quantidade,
+        CURRENT_TIMESTAMP, p_responsavel, p_os, 'MANUAL'
+    );
+    
+    RETURN 'Retirada manual realizada: ' || p_quantidade || ' ' || v_unidade_medida;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Views
+CREATE VIEW vw_estoque_consolidado AS
+SELECT 
+    p.id_produto,
+    p.nome,
+    p.unidade_medida,
+    SUM(l.quantidade) - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        JOIN lote l2 ON m.id_lote = l2.id_lote
+        WHERE l2.id_produto = p.id_produto AND m.tipo = 'SAIDA'
+    ), 0) AS saldo_disponivel
+FROM 
+    produto p
+JOIN 
+    lote l ON p.id_produto = l.id_produto
+GROUP BY 
+    p.id_produto;
+
+CREATE VIEW vw_lotes_disponiveis AS
+SELECT 
+    l.id_lote,
+    l.id_produto,
+    p.nome AS produto,
+    p.unidade_medida,
+    l.quantidade - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+    ), 0) AS saldo,
+    l.data_entrada,
+    l.fornecedor
+FROM 
+    lote l
+JOIN 
+    produto p ON l.id_produto = p.id_produto
+WHERE 
+    l.quantidade - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+    ), 0) > 0
+ORDER BY 
+    l.data_entrada;
+
+CREATE TABLE lista_materiais (
+    id_lista SERIAL PRIMARY KEY,
+    data_criacao TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    itens JSONB NOT NULL,  -- Armazena a lista completa (produtos, quantidades, preços digitados)
+    responsavel VARCHAR(100) NOT NULL,
+    observacao TEXT,
+    os_referencia VARCHAR(50)  
+);
+
+-- 1. View do estoque consolidado (saldo atual)
+CREATE OR REPLACE VIEW vw_estoque_consolidado AS
+SELECT 
+    p.id_produto,
+    p.nome,
+    p.unidade_medida,
+    SUM(l.quantidade) - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        JOIN lote l2 ON m.id_lote = l2.id_lote
+        WHERE l2.id_produto = p.id_produto AND m.tipo = 'SAIDA'
+    ), 0) AS saldo_disponivel
+FROM 
+    produto p
+JOIN 
+    lote l ON p.id_produto = l.id_produto
+GROUP BY 
+    p.id_produto;
+
+-- 2. View de lotes disponíveis (para retiradas FIFO)
+CREATE OR REPLACE VIEW vw_lotes_disponiveis AS
+SELECT 
+    l.id_lote,
+    l.id_produto,
+    p.nome AS produto,
+    p.unidade_medida,
+    l.quantidade - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+    ), 0) AS saldo,
+    l.data_entrada,
+    l.fornecedor
+FROM 
+    lote l
+JOIN 
+    produto p ON l.id_produto = p.id_produto
+WHERE 
+    l.quantidade - COALESCE((
+        SELECT SUM(m.quantidade)
+        FROM movimentacao m
+        WHERE m.id_lote = l.id_lote AND m.tipo = 'SAIDA'
+    ), 0) > 0
+ORDER BY 
+    l.data_entrada;
+
+-- Para consultas rápidas de estoque
+CREATE INDEX IF NOT EXISTS idx_lote_produto ON lote(id_produto);
+CREATE INDEX IF NOT EXISTS idx_movimentacao_lote ON movimentacao(id_lote);
+
+-- Para busca por nome de produto
+CREATE INDEX IF NOT EXISTS idx_produto_nome ON produto(nome);
+
+CREATE TABLE propostas (
+    proposta_id SERIAL PRIMARY KEY,
+    numero_proposta VARCHAR(20) NOT NULL UNIQUE,
+    data_proposta DATE NOT NULL,
+    cliente VARCHAR(100) NOT NULL,
+    setor VARCHAR(50) NOT NULL,
+    descricao_servico TEXT NOT NULL,
+    responsavel_venda VARCHAR(100) NOT NULL,
+    indicacao VARCHAR(100)
+);
+
+-- Índices para melhorar performance nas buscas
+CREATE INDEX idx_proposta_numero ON propostas(numero_proposta);
+CREATE INDEX idx_proposta_cliente ON propostas(cliente);
+CREATE INDEX idx_proposta_responsavel ON propostas(responsavel_venda);
+
+-- Tabela de Clientes (base para tudo)
+CREATE TABLE clientes (
+    id_cliente SERIAL PRIMARY KEY,
+    cpf_cnpj VARCHAR(20) NOT NULL,
+    nome VARCHAR(100) NOT NULL
+);
+
+-- Tabela de Projetos/OS (núcleo do sistema)
+CREATE TABLE projetos (
+    numero_os INT PRIMARY KEY,  
+    tipo VARCHAR(50) NOT NULL,
+    id_cliente INT NOT NULL REFERENCES clientes(id_cliente),
+    cliente_nome VARCHAR(100) NOT NULL,  
+    cliente_cpf_cnpj VARCHAR(20) NOT NULL,
+    data_os DATE NOT NULL,
+    numero_proposta VARCHAR(20),
+    valor_servico DECIMAL(12,2),
+    valor_material DECIMAL(12,2),
+    total DECIMAL(12,2),
+    endereco_obra VARCHAR(200),
+    cidade_obra VARCHAR(50),
+    estado_obra CHAR(2),
+    contato VARCHAR(100),
+    nome_responsavel VARCHAR(100),
+    status VARCHAR(30) 
+);
+
+-- Tabela de Orçamentos
+CREATE TABLE orcamentos (
+    id_orcamento SERIAL PRIMARY KEY,
+    numero_os_projeto INT NOT NULL REFERENCES projetos(numero_os),
+    data_orcamento DATE NOT NULL,
+    mao_de_obra DECIMAL(12,2) DEFAULT 0,
+    alimentacao DECIMAL(12,2) DEFAULT 0,
+    hospedagem DECIMAL(12,2) DEFAULT 0,
+    viagem DECIMAL(12,2) DEFAULT 0,
+    seguranca_trabalho DECIMAL(12,2) DEFAULT 0,
+    material DECIMAL(12,2) DEFAULT 0,
+    equipamento DECIMAL(12,2) DEFAULT 0,
+    andaime DECIMAL(12,2) DEFAULT 0,
+    documentacao DECIMAL(12,2) DEFAULT 0,
+    outros DECIMAL(12,2) DEFAULT 0,
+    total DECIMAL(12,2) GENERATED ALWAYS AS (
+        mao_de_obra + alimentacao + hospedagem + viagem +
+        seguranca_trabalho + material + equipamento +
+        andaime + documentacao + outros
+    ) STORED
+);
+
+-- Tabela de Despesas
+CREATE TABLE despesas (
+    id_despesa SERIAL PRIMARY KEY,
+    numero_os_projeto INT NOT NULL REFERENCES projetos(numero_os),
+    data_despesa DATE NOT NULL,
+    observacao TEXT,
+    mao_de_obra DECIMAL(12,2) DEFAULT 0,
+    alimentacao DECIMAL(12,2) DEFAULT 0,
+    hospedagem DECIMAL(12,2) DEFAULT 0,
+    viagem DECIMAL(12,2) DEFAULT 0,
+    seguranca_trabalho DECIMAL(12,2) DEFAULT 0,
+    material DECIMAL(12,2) DEFAULT 0,
+    equipamento DECIMAL(12,2) DEFAULT 0,
+    andaime DECIMAL(12,2) DEFAULT 0,
+    documentacao DECIMAL(12,2) DEFAULT 0,
+    outros DECIMAL(12,2) DEFAULT 0,
+    total DECIMAL(12,2) GENERATED ALWAYS AS (
+        mao_de_obra + alimentacao + hospedagem + viagem +
+        seguranca_trabalho + material + equipamento +
+        andaime + documentacao + outros
+    ) STORED
+);
+
+CREATE TABLE receitas (
+    id_receita SERIAL PRIMARY KEY,
+    numero_os_projeto INT NOT NULL REFERENCES projetos(numero_os),
+    data_receita DATE NOT NULL,
+    nf VARCHAR(20),
+    cliente VARCHAR(100) NOT NULL,
+    valor_servico DECIMAL(12,2),
+    valor_material DECIMAL(12,2),
+    imposto DECIMAL(5,2),  
+    icms DECIMAL(5,2),      
+    valor_liquido DECIMAL(12,2) NOT NULL
+);
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX idx_clientes_nome ON clientes USING gin (nome gin_trgm_ops);
+
+CREATE INDEX idx_projetos_numero_os ON projetos (numero_os);
+CREATE INDEX idx_projetos_cliente ON projetos (id_cliente);
+CREATE INDEX idx_projetos_proposta ON projetos (numero_proposta);
+
+CREATE INDEX idx_orcamentos_os ON orcamentos (numero_os_projeto);
+
+CREATE INDEX idx_despesas_os ON despesas (numero_os_projeto);
+
+CREATE INDEX idx_receitas_os ON receitas (numero_os_projeto);
+CREATE INDEX idx_receitas_nf ON receitas (nf);
+
+-- Tabela de usuários
+CREATE TABLE usuarios (
+    id SERIAL PRIMARY KEY,
+    nome VARCHAR(100) NOT NULL,
+    login VARCHAR(50) UNIQUE NOT NULL,
+    senha_hash VARCHAR(255) NOT NULL,
+    nivel_acesso VARCHAR(20) NOT NULL DEFAULT 'usuario',
+    ativo BOOLEAN NOT NULL DEFAULT TRUE,
+    email VARCHAR(100),
+    data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ultimo_login TIMESTAMP
+);
+
+-- Função para hash de senha
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS logs_auditoria
+(
+    id_log serial,
+    tabela_afetada VARCHAR(100) COLLATE pg_catalog."default" NOT NULL,
+    operacao VARCHAR(10) NOT NULL,
+    id_registro integer NOT NULL,
+    dados_anteriores jsonb,
+    usuario VARCHAR(100) NOT NULL,
+    data_hora timestamp DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT logs_auditoria_pkey PRIMARY KEY (id_log)
+)
+;
+CREATE OR REPLACE FUNCTION public.auditoria_update_delete()
+    RETURNS trigger
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE NOT LEAKPROOF SECURITY DEFINER
+AS $BODY$
+DECLARE
+    v_id_registro INTEGER;
+BEGIN
+    -- Determina o ID do registro conforme a tabela
+    IF TG_TABLE_NAME = 'projetos' THEN
+        v_id_registro := OLD.numero_os;
+    ELSIF TG_TABLE_NAME = 'lote' THEN
+        v_id_registro := OLD.id_lote;
+    ELSIF TG_TABLE_NAME = 'movimentacao' THEN
+        v_id_registro := OLD.id_movimentacao;
+    ELSIF TG_TABLE_NAME = 'produto' THEN
+        v_id_registro := OLD.id_produto;
+    ELSIF TG_TABLE_NAME = 'clientes' THEN
+        v_id_registro := OLD.id_cliente;
+    ELSIF TG_TABLE_NAME = 'orcamentos' THEN
+        v_id_registro := OLD.id_orcamento;
+    ELSIF TG_TABLE_NAME = 'despesas' THEN
+        v_id_registro := OLD.id_despesa;
+    ELSIF TG_TABLE_NAME = 'receitas' THEN
+        v_id_registro := OLD.id_receita;
+    ELSE
+        v_id_registro := OLD.id; -- Fallback para coluna padrão 'id'
+    END IF;
+    
+    INSERT INTO logs_auditoria (
+        tabela_afetada, 
+        operacao, 
+        id_registro, 
+        dados_anteriores,
+        usuario
+    ) VALUES (
+        TG_TABLE_NAME,
+        TG_OP,
+        v_id_registro,
+        to_jsonb(OLD),
+        CURRENT_USER
+    );
+    
+    RETURN NULL; -- Para AFTER triggers
+END;
+$BODY$;
