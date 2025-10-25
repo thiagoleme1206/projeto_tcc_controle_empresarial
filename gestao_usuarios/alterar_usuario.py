@@ -7,8 +7,8 @@ import bcrypt
 # -------------------- Configuração do Banco --------------------
 DB_CONFIG = {
     "dbname": "projeto_final",
-    "user": "postgres",
-    "password": "Edu1Sal2",
+    "user": "",
+    "password": "",
     "host": "localhost",
     "port": "5432"
 }
@@ -264,3 +264,4 @@ def abrir_tela_alterar_usuario(id_usuario, callback_atualizar=None):
     btn_aplicar.grid(row=20, column=0, columnspan=10, pady=30)
 
     tela.grab_set()  # Mantém foco nesta janela até ser fechada
+
