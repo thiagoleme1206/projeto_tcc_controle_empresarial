@@ -7,8 +7,8 @@ import bcrypt
 # -------------------- Configuração do Banco --------------------
 DB_CONFIG = {
     "dbname": "projeto_final",
-    "user": "postgres",
-    "password": "Edu1Sal2",
+    "user": "",
+    "password": "",
     "host": "localhost",
     "port": "5432"
 }
@@ -290,3 +290,4 @@ def abrir_tela_criar_usuario(callback_atualizar=None):
     # Inicialização
     criar_tabela()
     tela_login.grab_set()  # Trava foco nesta janela até fechar
+
