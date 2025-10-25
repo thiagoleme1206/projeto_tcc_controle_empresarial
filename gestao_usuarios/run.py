@@ -7,8 +7,8 @@ from psycopg2 import sql
 
 DB_CONFIG = {
     "dbname": "projeto_final",
-    "user": "postgres",
-    "password": "Edu1Sal2",
+    "user": "",
+    "password": "",
     "host": "localhost",
     "port": "5432"
 }
@@ -176,3 +176,4 @@ btn_criar_usuario.grid(row=0, column=8, padx=10)
 
 buscar_usuarios()
 control_central.mainloop()
+
